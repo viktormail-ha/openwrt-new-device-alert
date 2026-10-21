@@ -1,0 +1,252 @@
+#!/bin/sh
+# lanwatch-leases: читает /tmp/dhcp.leases (сеть не сканирует) и уведомляет в Telegram:
+#   - о новых устройствах;
+#   - о смене IP (EVENT_IP=1);
+#   - о возвращении устройства после долгого отсутствия (RETURN_DAYS > 0).
+# Неотправленные сообщения сохраняются в очередь и уходят при следующих запусках.
+# Запускается из cron раз в минуту.
+#
+# EN: reads /tmp/dhcp.leases (no network scanning) and notifies via Telegram about
+# new devices, IP changes and devices returning after a long absence.
+# Unsent messages are queued and retried. Run it from cron every minute.
+
+. /etc/lanwatch/config
+
+DB="/etc/lanwatch/devices.db"       # строка: mac|ip|имя|время последнего появления (unix)
+LEARN="/etc/lanwatch/learning"      # пока файл существует, уведомления не отправляются
+QUEUE="/etc/lanwatch/queue"         # очередь неотправленных сообщений
+LEASES="${LEASES:-/tmp/dhcp.leases}"
+LOCK="/tmp/lanwatch.lock"
+API="${TG_API:-https://api.telegram.org}"
+
+EVENT_IP="${EVENT_IP:-1}"
+RETURN_DAYS="${RETURN_DAYS:-0}"
+case "$RETURN_DAYS" in
+    ''|*[!0-9]*) RETURN_DAYS=0 ;;
+esac
+
+QN=0
+TG_DOWN=0
+
+clean_host() {
+    printf '%s' "$1" | tr -cd 'a-zA-Z0-9 ._()-'
+}
+
+# Производитель по первым трём байтам MAC. При ошибке возвращает пустую строку.
+vendor_lookup() {
+    OUI="$(echo "$1" | cut -d: -f1-3)"
+    curl -fsS --connect-timeout 3 --max-time 5 \
+        "https://api.macvendors.com/$OUI" 2>/dev/null \
+        | tr -cd 'a-zA-Z0-9 ._,&()-' | cut -c1-60
+}
+
+# Отправка одного сообщения: $1 = chat_id, $2 = текст.
+# Коды возврата: 0 = отправлено, 2 = сервер отклонил (повтор бесполезен), 1 = временный сбой.
+tg_send() {
+    CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 5 --max-time 10 \
+        -X POST "$API/bot${BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=$1" \
+        --data-urlencode "text=$2" 2>/dev/null)"
+    case "$CODE" in
+        200)             return 0 ;;
+        400|401|403|404) return 2 ;;
+        *)               return 1 ;;
+    esac
+}
+
+queue_add() {
+    mkdir -p "$QUEUE"
+    # Не более 50 сообщений: самое старое удаляется.
+    [ "$(ls "$QUEUE" | wc -l)" -ge 50 ] && rm -f "$QUEUE/$(ls "$QUEUE" | head -n1)"
+    QN=$((QN + 1))
+    { echo "$1"; printf '%s\n' "$2"; } > "$QUEUE/$(date +%s)-$$-$QN"
+    logger -t lanwatch "Telegram недоступен, сообщение в очереди (chat_id=$1)"
+}
+
+# Отправка всем получателям; при сбое связи сообщение попадает в очередь.
+send_all() {
+    for chat in $CHAT_IDS; do
+        if [ "$TG_DOWN" = "1" ]; then
+            queue_add "$chat" "$MSG"
+            continue
+        fi
+        tg_send "$chat" "$MSG"
+        rc=$?
+        case "$rc" in
+            0) ;;
+            2) logger -t lanwatch "Telegram отклонил сообщение (код $CODE, chat_id=$chat): проверь токен и chat_id" ;;
+            *) TG_DOWN=1; queue_add "$chat" "$MSG" ;;
+        esac
+    done
+}
+
+# Повторная отправка накопленной очереди.
+flush_queue() {
+    [ -d "$QUEUE" ] || return 0
+    for F in "$QUEUE"/*; do
+        [ -f "$F" ] || continue
+        chat="$(head -n1 "$F")"
+        text="$(tail -n +2 "$F")"
+        tg_send "$chat" "$text"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            rm -f "$F"
+        elif [ "$rc" -eq 2 ]; then
+            logger -t lanwatch "Telegram отклонил сообщение из очереди (код $CODE, chat_id=$chat), удалено"
+            rm -f "$F"
+        else
+            TG_DOWN=1
+            break   # нет связи: повторим в следующий запуск
+        fi
+    done
+}
+
+[ -r "$LEASES" ] || exit 0
+
+# Защита от одновременного запуска.
+mkdir "$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+trap 'exit 1' INT TERM
+
+# Текущее время; пока часы не синхронизированы, время не используется.
+NOW="$(date +%s)"
+TIME_OK=0
+[ "$NOW" -ge 1700000000 ] && TIME_OK=1
+
+flush_queue
+
+touch "$DB"
+
+while read -r _ MAC IP HOST _; do
+    MAC="$(echo "$MAC" | tr 'A-F' 'a-f')"
+
+    # Только строки с корректным MAC и IPv4.
+    case "$MAC" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *) continue ;;
+    esac
+    case "$IP" in
+        ""|*:*) continue ;;
+    esac
+
+    HOST="$(clean_host "$HOST")"
+
+    LINE="$(grep "^$MAC|" "$DB" | head -n1)"
+    OLD_IP="$(echo "$LINE" | cut -d'|' -f2)"
+    OLD_HOST="$(echo "$LINE" | cut -d'|' -f3)"
+    OLD_SEEN="$(echo "$LINE" | cut -d'|' -f4)"
+    case "$OLD_SEEN" in
+        ''|*[!0-9]*) OLD_SEEN=0 ;;
+    esac
+
+    # Определяем событие.
+    EVENT=""
+    AWAY_DAYS=0
+    if [ -z "$LINE" ]; then
+        EVENT="new"
+    elif [ "$RETURN_DAYS" -gt 0 ] && [ "$TIME_OK" -eq 1 ] && [ "$OLD_SEEN" -gt 0 ] \
+         && [ $((NOW - OLD_SEEN)) -gt $((RETURN_DAYS * 86400)) ]; then
+        EVENT="back"
+        AWAY_DAYS=$(( (NOW - OLD_SEEN) / 86400 ))
+    elif [ "$OLD_IP" != "$IP" ]; then
+        EVENT="ip"
+    fi
+
+    # Пустое имя не затирает уже известное.
+    [ -n "$HOST" ] || HOST="$OLD_HOST"
+
+    # Время последнего появления обновляем при событии и не чаще раза в сутки.
+    SEEN="$OLD_SEEN"
+    if [ "$TIME_OK" -eq 1 ]; then
+        if [ -n "$EVENT" ] || [ "$OLD_SEEN" -eq 0 ] || [ $((NOW - OLD_SEEN)) -ge 86400 ]; then
+            SEEN="$NOW"
+        fi
+    fi
+
+    # Ничего не изменилось: во flash не пишем.
+    if [ -z "$EVENT" ] && [ "$OLD_HOST" = "$HOST" ] && [ "$SEEN" = "$OLD_SEEN" ]; then
+        continue
+    fi
+
+    # Обновляем базу до отправки уведомления.
+    TMP="$DB.tmp"
+    { grep -v "^$MAC|" "$DB"; echo "$MAC|$IP|$HOST|$SEEN"; } > "$TMP" && mv "$TMP" "$DB"
+
+    # Нет события (обновилось только время или имя) либо идёт режим обучения.
+    [ -n "$EVENT" ] || continue
+    [ -f "$LEARN" ] && continue
+    [ "$EVENT" = "ip" ] && [ "$EVENT_IP" = "0" ] && continue
+
+    # Сеть определяем по маршруту до IP.
+    IFACE="$(ip -4 route get "$IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+    case "$IFACE" in
+        "")          NETWORK="неизвестная сеть" ;;
+        "$MAIN_IF")  NETWORK="Основная сеть" ;;
+        "$GUEST_IF") NETWORK="Гостевая сеть" ;;
+        *)           NETWORK="Сеть $IFACE" ;;
+    esac
+
+    # Случайный (приватный) MAC: второй символ первого октета 2, 6, a или e.
+    FIRST="${MAC%%:*}"
+    NOTE=""
+    VENDOR_LINE=""
+    case "${FIRST#?}" in
+        2|6|a|e)
+            NOTE="
+⚠️ MAC похож на случайный (приватный адрес Wi-Fi)"
+            ;;
+        *)
+            if [ "$VENDOR_LOOKUP" = "1" ]; then
+                VENDOR="$(vendor_lookup "$MAC")"
+                [ -n "$VENDOR" ] && VENDOR_LINE="
+Производитель: $VENDOR"
+                sleep 1   # ограничение частоты запросов сервиса
+            fi
+            ;;
+    esac
+
+    HOST_SHOW="${HOST:-без имени}"
+
+    case "$EVENT" in
+        new)
+            MSG="🆕 Новое устройство в сети
+
+Имя: $HOST_SHOW
+IP: $IP
+MAC: $MAC$VENDOR_LINE
+Сеть: $NETWORK$NOTE"
+            ;;
+        back)
+            BACK_IP="IP: $IP"
+            [ "$OLD_IP" != "$IP" ] && BACK_IP="IP: $IP (раньше $OLD_IP)"
+            MSG="🔙 Устройство снова в сети
+
+Имя: $HOST_SHOW
+$BACK_IP
+MAC: $MAC$VENDOR_LINE
+Не появлялось: $AWAY_DAYS дн.
+Сеть: $NETWORK$NOTE"
+            ;;
+        ip)
+            MSG="🔄 Устройство сменило IP
+
+Имя: $HOST_SHOW
+MAC: $MAC$VENDOR_LINE
+Старый IP: $OLD_IP
+Новый IP: $IP
+Сеть: $NETWORK$NOTE"
+            ;;
+    esac
+
+    # Пометка роутера последней строкой.
+    if [ -n "$ROUTER_NAME" ]; then
+        MSG="$MSG
+
+🛜 $ROUTER_NAME"
+    fi
+
+    send_all </dev/null
+done < "$LEASES"
+
+exit 0
