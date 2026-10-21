@@ -1,0 +1,36 @@
+# /etc/lanwatch/config
+# Скопируйте на роутер как /etc/lanwatch/config и выполните: chmod 600 /etc/lanwatch/config
+# EN: Copy to the router as /etc/lanwatch/config and run: chmod 600 /etc/lanwatch/config
+
+# Токен бота от @BotFather.
+# EN: Bot token from @BotFather.
+BOT_TOKEN='PUT_YOUR_BOT_TOKEN_HERE'
+
+# Получатели через пробел. Для групп chat_id обычно отрицательный (например -1001234567890);
+# бот должен быть добавлен в группу.
+# EN: Recipients, separated by spaces. Group chat_id is usually negative;
+# the bot must be added to the group.
+CHAT_IDS='123456789 987654321'
+
+# Имя роутера в конце сообщения (пусто = без пометки). Полезно, если роутеров несколько.
+# EN: Router label at the end of each message (empty = no label). Useful with several routers.
+ROUTER_NAME='Router 1'
+
+# Интерфейсы, на которых работает DHCP (проверьте: ip -br -4 addr).
+# Гостевую сеть не используете - оставьте GUEST_IF пустым.
+# EN: Interfaces that serve DHCP (check: ip -br -4 addr). No guest network - leave GUEST_IF empty.
+MAIN_IF='br-lan'
+GUEST_IF='br-guest'
+
+# Определять производителя по MAC через api.macvendors.com (1 = да, 0 = нет).
+# Отправляются только первые 3 байта MAC.
+# EN: Look up the vendor via api.macvendors.com (1 = yes, 0 = no). Only the first 3 MAC bytes are sent.
+VENDOR_LOOKUP='1'
+
+# Уведомления о смене IP (1 = да, 0 = нет).
+# EN: Notify about IP changes (1 = yes, 0 = no).
+EVENT_IP='1'
+
+# Сообщать, если устройство вернулось после отсутствия дольше N дней (0 = отключено).
+# EN: Notify when a device returns after being absent for more than N days (0 = disabled).
+RETURN_DAYS='30'
