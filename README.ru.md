@@ -98,7 +98,7 @@ MAC: 3c:a0:67:57:0d:bb
 ├── README.ru.md             обзор на русском
 ├── LICENSE                  MIT
 ├── src/
-│   ├── lanwatch-leases      скрипт (кладётся на роутер в /usr/bin/)
+│   ├── lanwatch-leases.ru   скрипт (кладётся на роутер в /usr/bin/ как lanwatch-leases без '.ru')
 │   ├── lanwatch-leases.en   английская версия скрипта
 │   └── config.example       пример конфига (кладётся в /etc/lanwatch/config)
 └── docs/
