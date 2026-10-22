@@ -55,7 +55,7 @@ ip -br -4 addr
 `mkdir -p /etc/lanwatch && chmod 700 /etc/lanwatch`
 
 Для установки скрипта выполни команду `cat > /usr/bin/lanwatch-leases <<'EOF'`
-Вставь **весь** текст из `src/lanwatch-leases`, нажми Enter, на отдельной строке введи `EOF` и снова нажми Enter. 
+Вставь **весь** текст из `src/lanwatch-leases.ru`, нажми Enter, на отдельной строке введи `EOF` и снова нажми Enter. 
 
 Для установки конфига выполни команду `cat > /etc/lanwatch/config <<'EOF'`
 Вставь **весь** текст из `src/config.example` (желательно перед вставкой сразу указать `BOT_TOKEN`, `CHAT_IDS`, `ROUTER_NAME`, `MAIN_IF`, `GUEST_IF`, но можно и потом, смотри ниже), нажми Enter, на отдельной строке введи `EOF` и снова нажми Enter.
