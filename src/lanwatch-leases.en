@@ -1,0 +1,295 @@
+#!/bin/sh
+# lanwatch-leases: reads /tmp/dhcp.leases (no network scanning) and sends Telegram alerts about:
+#   - new devices;
+#   - IP changes (EVENT_IP=1);
+#   - devices returning after a long absence (RETURN_DAYS > 0).
+# Unsent messages are stored in a queue and delivered on the next runs.
+# If one MAC has several leases (e.g. its client-id changed), the newest one is used.
+# The number of notifications per hour is capped (MAX_PER_HOUR).
+# Run it from cron once a minute.
+
+. /etc/lanwatch/config
+
+DB="/etc/lanwatch/devices.db"       # line: mac|ip|name|last seen (unix time)
+LEARN="/etc/lanwatch/learning"      # while this file exists, no notifications are sent
+QUEUE="/etc/lanwatch/queue"         # queue of unsent messages
+LEASES="${LEASES:-/tmp/dhcp.leases}"
+LOCK="/tmp/lanwatch.lock"
+RATE="/tmp/lanwatch.rate"           # timestamps of recent notifications (in RAM)
+API="${TG_API:-https://api.telegram.org}"
+
+EVENT_IP="${EVENT_IP:-1}"
+RETURN_DAYS="${RETURN_DAYS:-0}"
+case "$RETURN_DAYS" in
+    ''|*[!0-9]*) RETURN_DAYS=0 ;;
+esac
+
+# Maximum notifications per hour (0 = unlimited). Protects against message floods.
+MAX_PER_HOUR="${MAX_PER_HOUR:-30}"
+case "$MAX_PER_HOUR" in
+    ''|*[!0-9]*) MAX_PER_HOUR=30 ;;
+esac
+
+QN=0
+TG_DOWN=0
+
+clean_host() {
+    printf '%s' "$1" | tr -cd 'a-zA-Z0-9 ._()-'
+}
+
+# Vendor by the first three bytes of the MAC. Returns an empty string on failure.
+vendor_lookup() {
+    OUI="$(echo "$1" | cut -d: -f1-3)"
+    curl -fsS --connect-timeout 3 --max-time 5 \
+        "https://api.macvendors.com/$OUI" 2>/dev/null \
+        | tr -cd 'a-zA-Z0-9 ._,&()-' | cut -c1-60
+}
+
+# Send one message: $1 = chat_id, $2 = text.
+# Return codes: 0 = sent, 2 = rejected by the server (retrying is useless), 1 = temporary failure.
+tg_send() {
+    CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 5 --max-time 10 \
+        -X POST "$API/bot${BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=$1" \
+        --data-urlencode "text=$2" 2>/dev/null)"
+    case "$CODE" in
+        200)             return 0 ;;
+        400|401|403|404) return 2 ;;
+        *)               return 1 ;;
+    esac
+}
+
+queue_add() {
+    mkdir -p "$QUEUE"
+    # At most 50 messages: the oldest one is dropped.
+    [ "$(ls "$QUEUE" | wc -l)" -ge 50 ] && rm -f "$QUEUE/$(ls "$QUEUE" | head -n1)"
+    QN=$((QN + 1))
+    { echo "$1"; printf '%s\n' "$2"; } > "$QUEUE/$(date +%s)-$$-$QN"
+    logger -t lanwatch "Telegram unreachable, message queued (chat_id=$1)"
+}
+
+# Send to all recipients; on a connection failure the message goes to the queue.
+send_all() {
+    for chat in $CHAT_IDS; do
+        if [ "$TG_DOWN" = "1" ]; then
+            queue_add "$chat" "$MSG"
+            continue
+        fi
+        tg_send "$chat" "$MSG"
+        rc=$?
+        case "$rc" in
+            0) ;;
+            2) logger -t lanwatch "Telegram rejected the message (code $CODE, chat_id=$chat): check the token and chat_id" ;;
+            *) TG_DOWN=1; queue_add "$chat" "$MSG" ;;
+        esac
+    done
+}
+
+# Retry the queued messages.
+flush_queue() {
+    [ -d "$QUEUE" ] || return 0
+    for F in "$QUEUE"/*; do
+        [ -f "$F" ] || continue
+        chat="$(head -n1 "$F")"
+        text="$(tail -n +2 "$F")"
+        tg_send "$chat" "$text"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            rm -f "$F"
+        elif [ "$rc" -eq 2 ]; then
+            logger -t lanwatch "Telegram rejected a queued message (code $CODE, chat_id=$chat), dropped"
+            rm -f "$F"
+        else
+            TG_DOWN=1
+            break   # no connection: retry on the next run
+        fi
+    done
+}
+
+# Rate limit: returns 0 = may send, 1 = suppress.
+# On the first overflow one warning is sent.
+rate_check() {
+    [ "$MAX_PER_HOUR" -gt 0 ] || return 0
+    touch "$RATE"
+    awk -v c="$((NOW - 3600))" '$1 > c' "$RATE" > "$RATE.tmp" && mv "$RATE.tmp" "$RATE"
+    CNT=$(( $(wc -l < "$RATE") ))
+    if [ "$CNT" -lt "$MAX_PER_HOUR" ]; then
+        echo "$NOW" >> "$RATE"
+        return 0
+    fi
+    if [ "$CNT" -eq "$MAX_PER_HOUR" ]; then
+        echo "$NOW" >> "$RATE"
+        MSG="⚠️ Too many notifications: more than $MAX_PER_HOUR per hour. Further messages are suppressed until the rate drops. Check /tmp/dhcp.leases and /etc/lanwatch/devices.db."
+        if [ -n "$ROUTER_NAME" ]; then
+            MSG="$MSG
+
+🛜 $ROUTER_NAME"
+        fi
+        send_all </dev/null
+        logger -t lanwatch "notification limit exceeded ($MAX_PER_HOUR per hour), further messages are suppressed"
+    fi
+    return 1
+}
+
+[ -r "$LEASES" ] || exit 0
+
+# Protection against concurrent runs.
+mkdir "$LOCK" 2>/dev/null || exit 0
+LTMP="/tmp/lanwatch.leases.$$"
+trap 'rmdir "$LOCK" 2>/dev/null; rm -f "$LTMP"' EXIT
+trap 'exit 1' INT TERM
+
+# Current time; until the clock is synchronized, time-based logic is skipped.
+NOW="$(date +%s)"
+TIME_OK=0
+[ "$NOW" -ge 1700000000 ] && TIME_OK=1
+
+flush_queue
+
+touch "$DB"
+
+# If one MAC has several leases (e.g. its client-id changed), use the newest one.
+# Expiry 0 means an infinite lease and counts as the newest.
+awk '
+{
+    m = tolower($2)
+    e = ($1 == 0) ? 9999999999 : $1 + 0
+    if (!(m in best) || e > best[m]) { best[m] = e; keep[m] = $0 }
+}
+END { for (m in keep) print keep[m] }
+' "$LEASES" > "$LTMP"
+
+while read -r _ MAC IP HOST _; do
+    MAC="$(echo "$MAC" | tr 'A-F' 'a-f')"
+
+    # Only lines with a valid MAC and an IPv4 address.
+    case "$MAC" in
+        [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;;
+        *) continue ;;
+    esac
+    case "$IP" in
+        ""|*:*) continue ;;
+    esac
+
+    HOST="$(clean_host "$HOST")"
+
+    LINE="$(grep "^$MAC|" "$DB" | head -n1)"
+    OLD_IP="$(echo "$LINE" | cut -d'|' -f2)"
+    OLD_HOST="$(echo "$LINE" | cut -d'|' -f3)"
+    OLD_SEEN="$(echo "$LINE" | cut -d'|' -f4)"
+    case "$OLD_SEEN" in
+        ''|*[!0-9]*) OLD_SEEN=0 ;;
+    esac
+
+    # Determine the event.
+    EVENT=""
+    AWAY_DAYS=0
+    if [ -z "$LINE" ]; then
+        EVENT="new"
+    elif [ "$RETURN_DAYS" -gt 0 ] && [ "$TIME_OK" -eq 1 ] && [ "$OLD_SEEN" -gt 0 ] \
+         && [ $((NOW - OLD_SEEN)) -gt $((RETURN_DAYS * 86400)) ]; then
+        EVENT="back"
+        AWAY_DAYS=$(( (NOW - OLD_SEEN) / 86400 ))
+    elif [ "$OLD_IP" != "$IP" ]; then
+        EVENT="ip"
+    fi
+
+    # An empty name does not overwrite a known one.
+    [ -n "$HOST" ] || HOST="$OLD_HOST"
+
+    # Update "last seen" on an event and at most once a day.
+    SEEN="$OLD_SEEN"
+    if [ "$TIME_OK" -eq 1 ]; then
+        if [ -n "$EVENT" ] || [ "$OLD_SEEN" -eq 0 ] || [ $((NOW - OLD_SEEN)) -ge 86400 ]; then
+            SEEN="$NOW"
+        fi
+    fi
+
+    # Nothing changed: do not write to flash.
+    if [ -z "$EVENT" ] && [ "$OLD_HOST" = "$HOST" ] && [ "$SEEN" = "$OLD_SEEN" ]; then
+        continue
+    fi
+
+    # Update the database before sending the notification.
+    TMP="$DB.tmp"
+    { grep -v "^$MAC|" "$DB"; echo "$MAC|$IP|$HOST|$SEEN"; } > "$TMP" && mv "$TMP" "$DB"
+
+    # No event (only the time or the name was updated) or learning mode is on.
+    [ -n "$EVENT" ] || continue
+    [ -f "$LEARN" ] && continue
+    [ "$EVENT" = "ip" ] && [ "$EVENT_IP" = "0" ] && continue
+    rate_check || continue
+
+    # Detect the network by the route to the IP.
+    IFACE="$(ip -4 route get "$IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+    case "$IFACE" in
+        "")          NETWORK="unknown network" ;;
+        "$MAIN_IF")  NETWORK="Main network" ;;
+        "$GUEST_IF") NETWORK="Guest network" ;;
+        *)           NETWORK="Network $IFACE" ;;
+    esac
+
+    # Random (private) MAC: the second character of the first octet is 2, 6, a or e.
+    FIRST="${MAC%%:*}"
+    NOTE=""
+    VENDOR_LINE=""
+    case "${FIRST#?}" in
+        2|6|a|e)
+            NOTE="
+⚠️ MAC looks random (private Wi-Fi address)"
+            ;;
+        *)
+            if [ "$VENDOR_LOOKUP" = "1" ]; then
+                VENDOR="$(vendor_lookup "$MAC")"
+                [ -n "$VENDOR" ] && VENDOR_LINE="
+Vendor: $VENDOR"
+                sleep 1   # rate limit of the lookup service
+            fi
+            ;;
+    esac
+
+    HOST_SHOW="${HOST:-no name}"
+
+    case "$EVENT" in
+        new)
+            MSG="🆕 New device on the network
+
+Name: $HOST_SHOW
+IP: $IP
+MAC: $MAC$VENDOR_LINE
+Network: $NETWORK$NOTE"
+            ;;
+        back)
+            BACK_IP="IP: $IP"
+            [ "$OLD_IP" != "$IP" ] && BACK_IP="IP: $IP (was $OLD_IP)"
+            MSG="🔙 Device is back on the network
+
+Name: $HOST_SHOW
+$BACK_IP
+MAC: $MAC$VENDOR_LINE
+Not seen for: $AWAY_DAYS day(s)
+Network: $NETWORK$NOTE"
+            ;;
+        ip)
+            MSG="🔄 Device changed its IP
+
+Name: $HOST_SHOW
+MAC: $MAC$VENDOR_LINE
+Old IP: $OLD_IP
+New IP: $IP
+Network: $NETWORK$NOTE"
+            ;;
+    esac
+
+    # Router label as the last line.
+    if [ -n "$ROUTER_NAME" ]; then
+        MSG="$MSG
+
+🛜 $ROUTER_NAME"
+    fi
+
+    send_all </dev/null
+done < "$LTMP"
+
+exit 0
