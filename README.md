@@ -98,8 +98,8 @@ Full scanners solve a bigger task. This project solves a narrow one: *tell me wh
 ├── README.ru.md             Russian overview
 ├── LICENSE                  MIT
 ├── src/
-│   ├── lanwatch-leases      the script (goes to /usr/bin/ on the router)
-│   ├── lanwatch-leases.en   English script (goes to /usr/bin/ on the router)
+│   ├── lanwatch-leases.en   the script (goes to /usr/bin/ as lanwatch-leases on the router)
+│   ├── lanwatch-leases      the script in Russian language
 │   └── config.example       example config (goes to /etc/lanwatch/config)
 └── docs/
     ├── INSTALL.md           detailed manual (English)
