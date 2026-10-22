@@ -41,8 +41,6 @@ Network: Guest network
 🛜 Router 1
 ```
 
-(Message texts are in Russian by default; edit the strings in `src/lanwatch-leases` to translate them.)
-
 ## Requirements
 
 - OpenWrt 24.10 (tested). OpenWrt 25.x (package manager `apk`) should work, but has not been tested
@@ -96,15 +94,16 @@ Full scanners solve a bigger task. This project solves a narrow one: *tell me wh
 
 ```
 .
-├── README.md            English overview
-├── README.ru.md         Russian overview
-├── LICENSE              MIT
+├── README.md                English overview
+├── README.ru.md             Russian overview
+├── LICENSE                  MIT
 ├── src/
-│   ├── lanwatch-leases  the script (goes to /usr/bin/ on the router)
-│   └── config.example   example config (goes to /etc/lanwatch/config)
+│   ├── lanwatch-leases      the script (goes to /usr/bin/ on the router)
+│   ├── lanwatch-leases.en   English script (goes to /usr/bin/ on the router)
+│   └── config.example       example config (goes to /etc/lanwatch/config)
 └── docs/
-    ├── INSTALL.md       detailed manual (English)
-    └── INSTALL.ru.md    detailed manual (Russian)
+    ├── INSTALL.md           detailed manual (English)
+    └── INSTALL.ru.md        detailed manual (Russian)
 ```
 
 ## Security notes
