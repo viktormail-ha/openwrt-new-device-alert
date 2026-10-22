@@ -4,11 +4,14 @@
 #   - о смене IP (EVENT_IP=1);
 #   - о возвращении устройства после долгого отсутствия (RETURN_DAYS > 0).
 # Неотправленные сообщения сохраняются в очередь и уходят при следующих запусках.
+# Если у одного MAC несколько аренд (например, у устройства сменился client-id),
+# используется самая свежая. Есть ограничение числа уведомлений в час (MAX_PER_HOUR).
 # Запускается из cron раз в минуту.
 #
 # EN: reads /tmp/dhcp.leases (no network scanning) and notifies via Telegram about
 # new devices, IP changes and devices returning after a long absence.
-# Unsent messages are queued and retried. Run it from cron every minute.
+# Unsent messages are queued and retried. If one MAC has several leases, the newest one
+# is used. Notifications per hour are capped (MAX_PER_HOUR). Run it from cron every minute.
 
 . /etc/lanwatch/config
 
@@ -17,12 +20,19 @@ LEARN="/etc/lanwatch/learning"      # пока файл существует, у
 QUEUE="/etc/lanwatch/queue"         # очередь неотправленных сообщений
 LEASES="${LEASES:-/tmp/dhcp.leases}"
 LOCK="/tmp/lanwatch.lock"
+RATE="/tmp/lanwatch.rate"           # время недавних уведомлений (в RAM)
 API="${TG_API:-https://api.telegram.org}"
 
 EVENT_IP="${EVENT_IP:-1}"
 RETURN_DAYS="${RETURN_DAYS:-0}"
 case "$RETURN_DAYS" in
     ''|*[!0-9]*) RETURN_DAYS=0 ;;
+esac
+
+# Максимум уведомлений в час (0 = без ограничения). Защита от лавины сообщений.
+MAX_PER_HOUR="${MAX_PER_HOUR:-30}"
+case "$MAX_PER_HOUR" in
+    ''|*[!0-9]*) MAX_PER_HOUR=30 ;;
 esac
 
 QN=0
@@ -102,11 +112,37 @@ flush_queue() {
     done
 }
 
+# Ограничение частоты: 0 = можно отправлять, 1 = подавить.
+# При первом превышении отправляется одно предупреждение.
+rate_check() {
+    [ "$MAX_PER_HOUR" -gt 0 ] || return 0
+    touch "$RATE"
+    awk -v c="$((NOW - 3600))" '$1 > c' "$RATE" > "$RATE.tmp" && mv "$RATE.tmp" "$RATE"
+    CNT=$(( $(wc -l < "$RATE") ))
+    if [ "$CNT" -lt "$MAX_PER_HOUR" ]; then
+        echo "$NOW" >> "$RATE"
+        return 0
+    fi
+    if [ "$CNT" -eq "$MAX_PER_HOUR" ]; then
+        echo "$NOW" >> "$RATE"
+        MSG="⚠️ Слишком много уведомлений: больше $MAX_PER_HOUR за час. Следующие сообщения подавляются, пока частота не снизится. Проверьте /tmp/dhcp.leases и /etc/lanwatch/devices.db."
+        if [ -n "$ROUTER_NAME" ]; then
+            MSG="$MSG
+
+🛜 $ROUTER_NAME"
+        fi
+        send_all </dev/null
+        logger -t lanwatch "превышен лимит уведомлений ($MAX_PER_HOUR в час), последующие подавляются"
+    fi
+    return 1
+}
+
 [ -r "$LEASES" ] || exit 0
 
 # Защита от одновременного запуска.
 mkdir "$LOCK" 2>/dev/null || exit 0
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+LTMP="/tmp/lanwatch.leases.$$"
+trap 'rmdir "$LOCK" 2>/dev/null; rm -f "$LTMP"' EXIT
 trap 'exit 1' INT TERM
 
 # Текущее время; пока часы не синхронизированы, время не используется.
@@ -117,6 +153,17 @@ TIME_OK=0
 flush_queue
 
 touch "$DB"
+
+# Если у одного MAC несколько аренд (например, сменился client-id), берём самую свежую.
+# Срок 0 означает бессрочную аренду и считается самым свежим.
+awk '
+{
+    m = tolower($2)
+    e = ($1 == 0) ? 9999999999 : $1 + 0
+    if (!(m in best) || e > best[m]) { best[m] = e; keep[m] = $0 }
+}
+END { for (m in keep) print keep[m] }
+' "$LEASES" > "$LTMP"
 
 while read -r _ MAC IP HOST _; do
     MAC="$(echo "$MAC" | tr 'A-F' 'a-f')"
@@ -177,6 +224,7 @@ while read -r _ MAC IP HOST _; do
     [ -n "$EVENT" ] || continue
     [ -f "$LEARN" ] && continue
     [ "$EVENT" = "ip" ] && [ "$EVENT_IP" = "0" ] && continue
+    rate_check || continue
 
     # Сеть определяем по маршруту до IP.
     IFACE="$(ip -4 route get "$IP" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
@@ -247,6 +295,6 @@ MAC: $MAC$VENDOR_LINE
     fi
 
     send_all </dev/null
-done < "$LEASES"
+done < "$LTMP"
 
 exit 0
