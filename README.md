@@ -99,7 +99,7 @@ Full scanners solve a bigger task. This project solves a narrow one: *tell me wh
 ├── LICENSE                  MIT
 ├── src/
 │   ├── lanwatch-leases.en   the script (goes to /usr/bin/ as lanwatch-leases on the router)
-│   ├── lanwatch-leases      the script in Russian language
+│   ├── lanwatch-leases.ru   the script in Russian language
 │   └── config.example       example config (goes to /etc/lanwatch/config)
 └── docs/
     ├── INSTALL.md           detailed manual (English)
