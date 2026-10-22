@@ -67,6 +67,7 @@ All settings live in `/etc/lanwatch/config` (see [src/config.example](src/config
 | `VENDOR_LOOKUP` | `1` = look up the vendor via api.macvendors.com (only the first 3 MAC bytes are sent), `0` = off |
 | `EVENT_IP` | `1` = alert on IP change, `0` = off |
 | `RETURN_DAYS` | Alert when a device returns after more than N days, `0` = off |
+| `MAX_PER_HOUR` | Maximum notifications per hour, 0 = unlimited (one warning is sent when exceeded) |
 
 ## Pros and cons compared to full network scanners
 
