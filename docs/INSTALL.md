@@ -55,7 +55,7 @@ Create a directory:
 `mkdir -p /etc/lanwatch && chmod 700 /etc/lanwatch`
 
 To install the script run the command `cat > /usr/bin/lanwatch-leases <<'EOF'`
-Paste the **entire** content of `src/lanwatch-leases`, press Enter, type `EOF` on its own line and press Enter again. 
+Paste the **entire** content of `src/lanwatch-leases.en`, press Enter, type `EOF` on its own line and press Enter again. 
 
 To install the config run the command `cat > /etc/lanwatch/config <<'EOF'`
 Paste the **entire** content of `src/config.example` (before paste it's recommended to specify `BOT_TOKEN`, `CHAT_IDS`, `ROUTER_NAME`, `MAIN_IF`, `GUEST_IF` right away, but you can also set it later; see below), press Enter, type `EOF` on its own line and press Enter again.
