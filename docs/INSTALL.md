@@ -191,7 +191,7 @@ After upgrading reinstall the packages (step 1), run `/etc/init.d/cron enable &&
 
 ```sh
 ls -l /usr/bin/lanwatch-leases /etc/lanwatch
-ip -br -4 addr
+ip -4 addr | awk '/^[0-9]+:/{i=$2; sub(/:$/,"",i)} /inet /{print i, $2}'
 logread -e lanwatch
 ```
 
