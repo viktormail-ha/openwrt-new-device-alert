@@ -38,7 +38,7 @@ uci -q get network.guest.device
 ip -4 addr | awk '/^[0-9]+:/{i=$2; sub(/:$/,"",i)} /inet /{print i, $2}'
 ```
 
-You need the names of the devices that serve DHCP, for example `br-lan` and `br-guest`. They may differ on your router (for example `br-lan.20` for a VLAN): match them by subnet in the output of `ip -br -4 addr`.
+You need the names of the devices that serve DHCP, for example `br-lan` and `br-guest`. They may differ on your router (for example `br-lan.20` for a VLAN): match them by subnet in the output of `ip -4 addr | awk '/^[0-9]+:/{i=$2; sub(/:$/,"",i)} /inet /{print i, $2}'`.
 
 ## 3. Create a Telegram bot and get your chat id
 
