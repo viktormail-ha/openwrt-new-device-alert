@@ -35,7 +35,7 @@ apk add curl ca-bundle # libcurl4 may also be required; see note below
 uci show dhcp | grep -E "dhcp\.(lan|guest)\.interface"
 uci -q get network.lan.device
 uci -q get network.guest.device
-ip -br -4 addr
+ip -4 addr | awk '/^[0-9]+:/{i=$2; sub(/:$/,"",i)} /inet /{print i, $2}'
 ```
 
 You need the names of the devices that serve DHCP, for example `br-lan` and `br-guest`. They may differ on your router (for example `br-lan.20` for a VLAN): match them by subnet in the output of `ip -br -4 addr`.
